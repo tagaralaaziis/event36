@@ -1,42 +1,63 @@
-import mysql from 'mysql2/promise'
+import mysql from 'mysql2/promise';
 
-// Create connection pool for better performance
-const pool = mysql.createPool({
+const dbConfig = {
   host: process.env.DB_HOST || 'localhost',
-  port: parseInt(process.env.DB_PORT || '3306'),
   user: process.env.DB_USER || 'root',
   password: process.env.DB_PASSWORD || 'bismillah123',
   database: process.env.DB_NAME || 'event_management',
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
-})
+  port: parseInt(process.env.DB_PORT || '3306'),
+  timezone: '+00:00',
+  dateStrings: true,
+  ssl: false,
+  connectTimeout: 60000,
+  acquireTimeout: 60000,
+  timeout: 60000,
+};
 
-// Test database connection
-export async function testConnection(): Promise<boolean> {
-  try {
-    console.log('🔍 Testing MySQL connection...')
-    const connection = await pool.getConnection()
-    await connection.ping()
-    connection.release()
-    console.log('✅ MySQL connection successful')
-    return true
-  } catch (error) {
-    console.error('❌ MySQL connection failed:', error)
-    return false
+let connection: mysql.Connection | null = null;
+
+async function getConnection(): Promise<mysql.Connection> {
+  if (!connection) {
+    try {
+      connection = await mysql.createConnection(dbConfig);
+      console.log('Database connected successfully');
+    } catch (error) {
+      console.error('Database connection failed:', error);
+      throw error;
+    }
   }
+  return connection;
 }
 
-// Export the pool as default
-export default pool
+export const db = {
+  async query(sql: string, params?: any[]): Promise<any> {
+    const conn = await getConnection();
+    try {
+      const [results] = await conn.execute(sql, params);
+      return results;
+    } catch (error) {
+      console.error('Database query error:', error);
+      throw error;
+    }
+  },
 
-export async function logSystemEvent(type: string, message: string, meta?: any) {
-  try {
-    await pool.execute(
-      'INSERT INTO logs (type, message, meta) VALUES (?, ?, ?)',
-      [type, message, meta ? JSON.stringify(meta) : null]
-    )
-  } catch (err) {
-    console.error('Failed to log system event:', err)
+  async execute(sql: string, params?: any[]): Promise<any> {
+    const conn = await getConnection();
+    try {
+      const [results] = await conn.execute(sql, params);
+      return results;
+    } catch (error) {
+      console.error('Database execute error:', error);
+      throw error;
+    }
+  },
+
+  async close(): Promise<void> {
+    if (connection) {
+      await connection.end();
+      connection = null;
+    }
   }
-}
+};
+
+export default db;

@@ -1,103 +1,207 @@
-import fs from 'fs/promises'
-import path from 'path'
-import { PDFDocument, rgb, StandardFonts } from 'pdf-lib'
+import { PDFDocument, rgb, StandardFonts, PDFFont, PDFPage } from 'pdf-lib';
+import fs from 'fs';
+import path from 'path';
 
-export interface CertificateField {
-  key: string
-  x: number
-  y: number
-  fontFamily: string
-  fontSize: number
-  bold?: boolean
-  italic?: boolean
-  label?: string
-  active?: boolean
+export interface CertificateConfig {
+  participantName: string;
+  eventName: string;
+  eventDate: string;
+  eventLocation?: string;
+  completionDate?: string;
+  hours?: number;
+  instructor?: string;
+  projectCompleted?: string;
+  templatePath?: string;
 }
 
-export interface GenerateCertificatePdfLibOptions {
-  participant: any
-  template: any
-  fields: CertificateField[]
-  templateSize: { width: number; height: number }
-  eventSlug: string
-  mmRomawi: string
-  yyyy: number
-  certificateNumber: string
-}
+export class CertificatePDFGenerator {
+  private pdfDoc: PDFDocument;
+  private page: PDFPage;
+  private titleFont: PDFFont;
+  private bodyFont: PDFFont;
+  private nameFont: PDFFont;
 
-export async function generateCertificatePdfLib({ participant, template, fields, templateSize, eventSlug, mmRomawi, yyyy, certificateNumber }: GenerateCertificatePdfLibOptions): Promise<string> {
-  const templatePath = path.join(process.cwd(), 'public', template.template_path)
-  const imageBytes = await fs.readFile(templatePath)
-  const width_img = templateSize.width
-  const height_img = templateSize.height
-  const width_pdf = 842
-  const height_pdf = 595
-  // Generate PDF baru
-  const pdfDoc = await PDFDocument.create()
-  const page = pdfDoc.addPage([842, 595])
-  // Embed image sesuai tipe file
-  let image
-  if (template.template_path.toLowerCase().endsWith('.png')) {
-    image = await pdfDoc.embedPng(imageBytes)
-  } else if (
-    template.template_path.toLowerCase().endsWith('.jpg') ||
-    template.template_path.toLowerCase().endsWith('.jpeg')
-  ) {
-    image = await pdfDoc.embedJpg(imageBytes)
-  } else {
-    throw new Error('Template must be PNG or JPG/JPEG')
+  constructor() {
+    this.pdfDoc = null as any;
+    this.page = null as any;
+    this.titleFont = null as any;
+    this.bodyFont = null as any;
+    this.nameFont = null as any;
   }
-  page.drawImage(image, { x: 0, y: 0, width: 842, height: 595 })
-  for (const f of fields) {
-    if (f.active === false) continue
-    let value = ''
-    if (f.key === 'name') value = participant.name
-    else if (f.key === 'event') value = participant.event_name || ''
-    else if (f.key === 'number') value = certificateNumber
-    else if (f.key === 'token') value = participant.token
-    else if (f.key === 'date') value = new Date().toLocaleDateString()
-    else value = f.label || ''
-    // Konversi posisi field
-    const x_pdf = (f.x / width_img) * width_pdf
-    const y_pdf = height_pdf - ((f.y / height_img) * height_pdf)
-    // Font family & size & style
-    const fontMap = {
-      Helvetica: {
-        normal: StandardFonts.Helvetica,
-        bold: StandardFonts.HelveticaBold,
-        italic: StandardFonts.HelveticaOblique,
-        bolditalic: StandardFonts.HelveticaBoldOblique
-      },
-      'Times Roman': {
-        normal: StandardFonts.TimesRoman,
-        bold: StandardFonts.TimesRomanBold,
-        italic: StandardFonts.TimesRomanItalic,
-        bolditalic: StandardFonts.TimesRomanBoldItalic
-      },
-      Courier: {
-        normal: StandardFonts.Courier,
-        bold: StandardFonts.CourierBold,
-        italic: StandardFonts.CourierOblique,
-        bolditalic: StandardFonts.CourierBoldOblique
-      }
+
+  async initialize(): Promise<void> {
+    this.pdfDoc = await PDFDocument.create();
+    this.page = this.pdfDoc.addPage([842, 595]); // A4 landscape
+    
+    // Load fonts
+    this.titleFont = await this.pdfDoc.embedFont(StandardFonts.HelveticaBold);
+    this.bodyFont = await this.pdfDoc.embedFont(StandardFonts.Helvetica);
+    this.nameFont = await this.pdfDoc.embedFont(StandardFonts.HelveticaBold);
+  }
+
+  async generateCertificate(config: CertificateConfig): Promise<Uint8Array> {
+    await this.initialize();
+    
+    const { width, height } = this.page.getSize();
+    
+    // Draw certificate border
+    this.drawBorder(width, height);
+    
+    // Draw certificate content
+    this.drawTitle(width, height);
+    this.drawParticipantInfo(config, width, height);
+    this.drawEventInfo(config, width, height);
+    this.drawSignature(width, height);
+    
+    // Return PDF bytes
+    return await this.pdfDoc.save();
+  }
+
+  private drawBorder(width: number, height: number): void {
+    // Outer border
+    this.page.drawRectangle({
+      x: 50,
+      y: 50,
+      width: width - 100,
+      height: height - 100,
+      borderColor: rgb(0.2, 0.2, 0.2),
+      borderWidth: 3,
+    });
+    
+    // Inner border
+    this.page.drawRectangle({
+      x: 60,
+      y: 60,
+      width: width - 120,
+      height: height - 120,
+      borderColor: rgb(0.4, 0.4, 0.4),
+      borderWidth: 1,
+    });
+  }
+
+  private drawTitle(width: number, height: number): void {
+    this.page.drawText('CERTIFICATE OF COMPLETION', {
+      x: width / 2 - 180,
+      y: height - 150,
+      size: 28,
+      font: this.titleFont,
+      color: rgb(0.1, 0.1, 0.1),
+    });
+  }
+
+  private drawParticipantInfo(config: CertificateConfig, width: number, height: number): void {
+    // "This is to certify that" text
+    this.page.drawText('This is to certify that', {
+      x: width / 2 - 80,
+      y: height - 200,
+      size: 14,
+      font: this.bodyFont,
+      color: rgb(0.3, 0.3, 0.3),
+    });
+    
+    // Participant name
+    this.page.drawText(config.participantName, {
+      x: width / 2 - (config.participantName.length * 8),
+      y: height - 250,
+      size: 24,
+      font: this.nameFont,
+      color: rgb(0.1, 0.1, 0.1),
+    });
+  }
+
+  private drawEventInfo(config: CertificateConfig, width: number, height: number): void {
+    // "has successfully completed" text
+    this.page.drawText('has successfully completed', {
+      x: width / 2 - 90,
+      y: height - 300,
+      size: 14,
+      font: this.bodyFont,
+      color: rgb(0.3, 0.3, 0.3),
+    });
+    
+    // Event name
+    this.page.drawText(config.eventName, {
+      x: width / 2 - (config.eventName.length * 6),
+      y: height - 340,
+      size: 18,
+      font: this.titleFont,
+      color: rgb(0.1, 0.1, 0.1),
+    });
+    
+    // Event location
+    if (config.eventLocation) {
+      this.page.drawText(`Location: ${config.eventLocation}`, {
+        x: width / 2 - 100,
+        y: height - 380,
+        size: 12,
+        font: this.bodyFont,
+        color: rgb(0.4, 0.4, 0.4),
+      });
     }
-    const fontSize = f.fontSize || 24
-    let styleKey = 'normal'
-    if (f.bold && f.italic) styleKey = 'bolditalic'
-    else if (f.bold) styleKey = 'bold'
-    else if (f.italic) styleKey = 'italic'
-    const font = await pdfDoc.embedFont((fontMap[f.fontFamily] && fontMap[f.fontFamily][styleKey]) || StandardFonts.Helvetica)
-    // Sanitize value
-    const sanitize = (str: string) => str.replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/[^\x20-\x7E\u00A0-\u024F]/g, '')
-    const safeValue = sanitize(value)
-    const textWidth = font.widthOfTextAtSize(safeValue, fontSize)
-    page.drawText(safeValue, { x: x_pdf - textWidth / 2, y: y_pdf, size: fontSize, font, color: rgb(0,0,0) })
+    
+    // Event date
+    this.page.drawText(`Date: ${config.eventDate}`, {
+      x: width / 2 - 60,
+      y: height - 400,
+      size: 12,
+      font: this.bodyFont,
+      color: rgb(0.4, 0.4, 0.4),
+    });
+    
+    // Completion date
+    if (config.completionDate) {
+      this.page.drawText(`Issued on: ${config.completionDate}`, {
+        x: width / 2 - 70,
+        y: height - 450,
+        size: 10,
+        font: this.bodyFont,
+        color: rgb(0.5, 0.5, 0.5),
+      });
+    }
   }
-  // Simpan PDF
-  const certDir = path.join(process.cwd(), 'public', 'certificates')
-  try { await fs.access(certDir) } catch { await fs.mkdir(certDir, { recursive: true }) }
-  const filename = `cert_${participant.event_id}_${participant.id || participant.participant_id}.pdf`
-  const filePath = path.join(certDir, filename)
-  await fs.writeFile(filePath, Buffer.from(await pdfDoc.save()))
-  return `/certificates/${filename}`
-} 
+
+  private drawSignature(width: number, height: number): void {
+    // Signature line
+    this.page.drawText('_____________________', {
+      x: width - 250,
+      y: 150,
+      size: 12,
+      font: this.bodyFont,
+      color: rgb(0.3, 0.3, 0.3),
+    });
+    
+    // Signature label
+    this.page.drawText('Authorized Signature', {
+      x: width - 240,
+      y: 130,
+      size: 10,
+      font: this.bodyFont,
+      color: rgb(0.5, 0.5, 0.5),
+    });
+  }
+
+  async saveCertificate(config: CertificateConfig, outputPath: string): Promise<string> {
+    const pdfBytes = await this.generateCertificate(config);
+    
+    // Ensure directory exists
+    const dir = path.dirname(outputPath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    
+    // Write file
+    fs.writeFileSync(outputPath, pdfBytes);
+    
+    return outputPath;
+  }
+}
+
+export async function generateCertificatePDF(config: CertificateConfig): Promise<Uint8Array> {
+  const generator = new CertificatePDFGenerator();
+  return await generator.generateCertificate(config);
+}
+
+export async function saveCertificatePDF(config: CertificateConfig, outputPath: string): Promise<string> {
+  const generator = new CertificatePDFGenerator();
+  return await generator.saveCertificate(config, outputPath);
+}

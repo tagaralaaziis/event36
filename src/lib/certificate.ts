@@ -1,69 +1,250 @@
-import fs from 'fs'
-import path from 'path'
+import { db } from './db';
+import { generateCertificate } from './certificate-generator';
+import { sendEmail } from './email';
+import fs from 'fs';
+import path from 'path';
 
-interface GenerateCertificateOptions {
-  participantName: string
-  eventName: string
-  participantId: number
-  eventId: number
-  certificateNumber: string
-  templatePath?: string // path ke file template desain (PNG/JPG)
+export interface Certificate {
+  id: number;
+  participant_id: number;
+  template_id?: number;
+  path: string;
+  sent: boolean;
+  sent_at?: string;
+  created_at: string;
+  participant_name?: string;
+  participant_email?: string;
+  event_name?: string;
 }
 
-export async function generateCertificate({ participantName, eventName, participantId, eventId, certificateNumber, templatePath }: GenerateCertificateOptions): Promise<string> {
-  // Pastikan folder public/certificates ada
-  const certDir = path.join(process.cwd(), 'public', 'certificates')
-  if (!fs.existsSync(certDir)) {
-    fs.mkdirSync(certDir, { recursive: true })
+export async function getCertificates(): Promise<Certificate[]> {
+  try {
+    const query = `
+      SELECT 
+        c.*,
+        p.name as participant_name,
+        p.email as participant_email,
+        e.name as event_name
+      FROM certificates c
+      JOIN participants p ON c.participant_id = p.id
+      JOIN tickets t ON p.ticket_id = t.id
+      JOIN events e ON t.event_id = e.id
+      ORDER BY c.created_at DESC
+    `;
+    
+    const certificates = await db.query(query);
+    return certificates || [];
+  } catch (error) {
+    console.error('Error fetching certificates:', error);
+    return [];
+  }
+}
+
+export async function getCertificateById(id: number): Promise<Certificate | null> {
+  try {
+    const query = `
+      SELECT 
+        c.*,
+        p.name as participant_name,
+        p.email as participant_email,
+        e.name as event_name
+      FROM certificates c
+      JOIN participants p ON c.participant_id = p.id
+      JOIN tickets t ON p.ticket_id = t.id
+      JOIN events e ON t.event_id = e.id
+      WHERE c.id = ?
+    `;
+    
+    const certificates = await db.query(query, [id]);
+    return certificates[0] || null;
+  } catch (error) {
+    console.error('Error fetching certificate:', error);
+    return null;
+  }
+}
+
+export async function getCertificatesByEventId(eventId: number): Promise<Certificate[]> {
+  try {
+    const query = `
+      SELECT 
+        c.*,
+        p.name as participant_name,
+        p.email as participant_email,
+        e.name as event_name
+      FROM certificates c
+      JOIN participants p ON c.participant_id = p.id
+      JOIN tickets t ON p.ticket_id = t.id
+      JOIN events e ON t.event_id = e.id
+      WHERE e.id = ?
+      ORDER BY c.created_at DESC
+    `;
+    
+    const certificates = await db.query(query, [eventId]);
+    return certificates || [];
+  } catch (error) {
+    console.error('Error fetching certificates by event:', error);
+    return [];
+  }
+}
+
+export async function generateCertificateForParticipant(
+  participantId: number,
+  templateId?: number
+): Promise<string> {
+  try {
+    return await generateCertificate(participantId, templateId);
+  } catch (error) {
+    console.error('Error generating certificate for participant:', error);
+    throw error;
+  }
+}
+
+export async function sendCertificateEmail(certificateId: number): Promise<boolean> {
+  try {
+    const certificate = await getCertificateById(certificateId);
+    
+    if (!certificate) {
+      throw new Error('Certificate not found');
+    }
+    
+    if (!certificate.participant_email) {
+      throw new Error('Participant email not found');
+    }
+    
+    // Check if certificate file exists
+    const certificatePath = path.join(process.cwd(), 'public', certificate.path);
+    if (!fs.existsSync(certificatePath)) {
+      throw new Error('Certificate file not found');
+    }
+    
+    // Send email with certificate attachment
+    const emailSent = await sendEmail({
+      to: certificate.participant_email,
+      subject: `Certificate for ${certificate.event_name}`,
+      html: `
+        <h2>Congratulations ${certificate.participant_name}!</h2>
+        <p>Thank you for participating in <strong>${certificate.event_name}</strong>.</p>
+        <p>Please find your certificate of completion attached to this email.</p>
+        <br>
+        <p>Best regards,<br>Event Management Team</p>
+      `,
+      attachments: [
+        {
+          filename: `certificate_${certificate.participant_name?.replace(/\s+/g, '_')}.pdf`,
+          path: certificatePath
+        }
+      ]
+    });
+    
+    if (emailSent) {
+      // Update certificate as sent
+      await db.execute(
+        'UPDATE certificates SET sent = TRUE, sent_at = NOW() WHERE id = ?',
+        [certificateId]
+      );
+    }
+    
+    return emailSent;
+  } catch (error) {
+    console.error('Error sending certificate email:', error);
+    return false;
+  }
+}
+
+export async function regenerateCertificate(
+  certificateId: number,
+  templateId?: number
+): Promise<string> {
+  try {
+    const certificate = await getCertificateById(certificateId);
+    
+    if (!certificate) {
+      throw new Error('Certificate not found');
+    }
+    
+    // Delete old certificate file if exists
+    const oldPath = path.join(process.cwd(), 'public', certificate.path);
+    if (fs.existsSync(oldPath)) {
+      fs.unlinkSync(oldPath);
+    }
+    
+    // Generate new certificate
+    const newPath = await generateCertificate(certificate.participant_id, templateId);
+    
+    // Update certificate record
+    await db.execute(
+      'UPDATE certificates SET path = ?, template_id = ?, sent = FALSE, sent_at = NULL, created_at = NOW() WHERE id = ?',
+      [newPath, templateId || null, certificateId]
+    );
+    
+    return newPath;
+  } catch (error) {
+    console.error('Error regenerating certificate:', error);
+    throw error;
+  }
+}
+
+export async function deleteCertificate(certificateId: number): Promise<boolean> {
+  try {
+    const certificate = await getCertificateById(certificateId);
+    
+    if (!certificate) {
+      return false;
+    }
+    
+    // Delete certificate file
+    const certificatePath = path.join(process.cwd(), 'public', certificate.path);
+    if (fs.existsSync(certificatePath)) {
+      fs.unlinkSync(certificatePath);
+    }
+    
+    // Delete certificate record
+    await db.execute('DELETE FROM certificates WHERE id = ?', [certificateId]);
+    
+    return true;
+  } catch (error) {
+    console.error('Error deleting certificate:', error);
+    return false;
+  }
+}
+
+export async function bulkGenerateCertificates(
+  participantIds: number[],
+  templateId?: number
+): Promise<{ success: string[], failed: string[] }> {
+  const success: string[] = [];
+  const failed: string[] = [];
+  
+  for (const participantId of participantIds) {
+    try {
+      const certificatePath = await generateCertificate(participantId, templateId);
+      success.push(certificatePath);
+    } catch (error) {
+      console.error(`Failed to generate certificate for participant ${participantId}:`, error);
+      failed.push(`Participant ID: ${participantId}`);
+    }
   }
   
-  // Nama file unik
-  const filename = `cert_${participantId}_${eventId}.pdf`
-  const filePath = path.join(certDir, filename)
-  const publicPath = `/certificates/${filename}`
+  return { success, failed };
+}
 
-  // Generate PDF using jsPDF instead of PDFKit to avoid font issues
-  return new Promise(async (resolve, reject) => {
+export async function bulkSendCertificates(certificateIds: number[]): Promise<{ success: number[], failed: number[] }> {
+  const success: number[] = [];
+  const failed: number[] = [];
+  
+  for (const certificateId of certificateIds) {
     try {
-      const { jsPDF } = await import('jspdf')
-      const doc = new jsPDF({
-        orientation: 'landscape',
-        unit: 'mm',
-        format: 'a4'
-      })
-
-      // Jika ada templatePath dan file gambar, gunakan sebagai background
-      if (templatePath && (templatePath.endsWith('.png') || templatePath.endsWith('.jpg') || templatePath.endsWith('.jpeg'))) {
-        const imgData = fs.readFileSync(templatePath)
-        // Convert buffer to base64
-        const base64Img = `data:image/${templatePath.endsWith('.png') ? 'png' : 'jpeg'};base64,${imgData.toString('base64')}`
-        doc.addImage(base64Img, 'PNG', 0, 0, 297, 210) // A4 landscape: 297x210mm
+      const sent = await sendCertificateEmail(certificateId);
+      if (sent) {
+        success.push(certificateId);
+      } else {
+        failed.push(certificateId);
       }
-
-      // Set font to built-in font
-      doc.setFont('helvetica', 'normal')
-      // Certificate content
-      doc.setFontSize(24)
-      doc.text('Certificate of Participation', 148, 50, { align: 'center' })
-      doc.setFontSize(18)
-      doc.text('Awarded to:', 148, 80, { align: 'center' })
-      doc.setFontSize(28)
-      doc.text(participantName, 148, 110, { align: 'center' })
-      doc.setFontSize(18)
-      doc.text('For participating in:', 148, 140, { align: 'center' })
-      doc.setFontSize(22)
-      doc.text(eventName, 148, 170, { align: 'center' })
-      doc.setFontSize(14)
-      doc.text(`Date: ${new Date().toLocaleDateString()}`, 148, 200, { align: 'center' })
-      // Tambahkan nomor sertifikat di pojok kanan bawah
-      doc.setFontSize(12)
-      doc.text(`Certificate No: ${certificateNumber}`, 280, 205, { align: 'right' })
-      // Save PDF
-      const pdfBuffer = Buffer.from(doc.output('arraybuffer'))
-      fs.writeFileSync(filePath, pdfBuffer)
-      resolve(publicPath)
     } catch (error) {
-      reject(error)
+      console.error(`Failed to send certificate ${certificateId}:`, error);
+      failed.push(certificateId);
     }
-  })
+  }
+  
+  return { success, failed };
 }
