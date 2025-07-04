@@ -1,49 +1,79 @@
-import { NextRequest, NextResponse } from 'next/server'
-import db from '@/lib/db'
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/lib/db';
+import Queue from 'bull';
 
-export async function GET(request: NextRequest, { params }: { params: { id: string } }) {
+// Initialize Redis connection
+const certificateQueue = new Queue('certificate generation', {
+  redis: {
+    host: process.env.REDIS_HOST || 'localhost',
+    port: parseInt(process.env.REDIS_PORT || '6379'),
+  },
+});
+
+export async function GET(
+  request: NextRequest,
+  { params }: { params: { id: string } }
+) {
   try {
-    const eventId = params.id
-    
-    // Get statistics for multi-template certificates
-    const [participantStats] = await db.execute(`
-      SELECT 
-        COUNT(DISTINCT p.id) as total_participants,
-        COUNT(DISTINCT CASE WHEN t.is_verified = TRUE THEN p.id END) as verified_participants,
-        COUNT(DISTINCT CASE WHEN c.id IS NOT NULL THEN p.id END) as participants_with_certificates,
-        COUNT(DISTINCT CASE WHEN c.sent = TRUE THEN p.id END) as participants_with_sent_certificates
+    const eventId = params.id;
+
+    // Get total participants
+    const [participantRows] = await db.execute(`
+      SELECT COUNT(*) as total
       FROM participants p
       JOIN tickets t ON p.ticket_id = t.id
-      LEFT JOIN certificates c ON c.participant_id = p.id
-      WHERE t.event_id = ?
-    `, [eventId])
+      WHERE t.event_id = ? AND t.is_verified = TRUE
+    `, [eventId]);
 
-    const [templateStats] = await db.execute(`
-      SELECT COUNT(*) as template_count
-      FROM certificate_templates_multi 
-      WHERE event_id = ?
-    `, [eventId])
+    const total = (participantRows[0] as any).total;
 
-    const [certificateStats] = await db.execute(`
-      SELECT 
-        COUNT(*) as total_certificates,
-        COUNT(CASE WHEN sent = TRUE THEN 1 END) as sent_certificates,
-        COUNT(CASE WHEN sent = FALSE THEN 1 END) as pending_certificates
+    // Get generated certificates count
+    const [generatedRows] = await db.execute(`
+      SELECT COUNT(*) as generated
       FROM certificates c
       JOIN participants p ON c.participant_id = p.id
       JOIN tickets t ON p.ticket_id = t.id
-      WHERE t.event_id = ?
-    `, [eventId])
+      WHERE t.event_id = ? AND c.path IS NOT NULL
+    `, [eventId]);
 
-    const stats = {
-      participants: (participantStats as any[])[0],
-      templates: (templateStats as any[])[0],
-      certificates: (certificateStats as any[])[0]
+    const generated = (generatedRows[0] as any).generated;
+
+    // Get sent certificates count
+    const [sentRows] = await db.execute(`
+      SELECT COUNT(*) as sent
+      FROM certificates c
+      JOIN participants p ON c.participant_id = p.id
+      JOIN tickets t ON p.ticket_id = t.id
+      WHERE t.event_id = ? AND c.sent = TRUE
+    `, [eventId]);
+
+    const sent = (sentRows[0] as any).sent;
+
+    // Get queue stats
+    const redis = certificateQueue.client;
+    const statsKey = `cert_generation_${eventId}`;
+    const redisStats = await redis.get(statsKey);
+    
+    let queueStats = {
+      total,
+      generated,
+      sent,
+      generationProgress: total > 0 ? (generated / total) * 100 : 0,
+      sendingProgress: total > 0 ? (sent / total) * 100 : 0
+    };
+
+    if (redisStats) {
+      const parsedStats = JSON.parse(redisStats);
+      queueStats = { ...queueStats, ...parsedStats };
     }
 
-    return NextResponse.json(stats)
+    return NextResponse.json(queueStats);
+
   } catch (error) {
-    console.error('Multi-template stats error:', error)
-    return NextResponse.json({ error: error instanceof Error ? error.message : 'Unknown error' }, { status: 500 })
+    console.error('Error getting certificate stats:', error);
+    return NextResponse.json(
+      { error: 'Failed to get certificate stats' },
+      { status: 500 }
+    );
   }
 }

@@ -1,135 +1,218 @@
-import db from '@/lib/db'
-import fs from 'fs/promises'
-import path from 'path'
-import { PDFDocument, rgb, StandardFonts } from 'pdf-lib'
+import { createCanvas, loadImage, registerFont } from 'canvas';
+import fs from 'fs';
+import path from 'path';
 
-export async function generateCertificate(participantId: string, forceRegenerate = false) {
-  const [existingCert] = await db.execute('SELECT * FROM certificates WHERE participant_id = ?', [participantId])
-  const certExists = (existingCert as any[]).length > 0
+interface TextElement {
+  id: string;
+  type: 'participant_name' | 'event_name' | 'certificate_number' | 'date' | 'token';
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  fontSize: number;
+  fontFamily: string;
+  fontWeight: 'normal' | 'bold';
+  fontStyle: 'normal' | 'italic';
+  color: string;
+  text: string;
+}
 
-  if (certExists && !forceRegenerate) {
-    throw new Error('Sertifikat untuk peserta ini sudah ada.')
-  }
+interface Template {
+  image: string;
+  elements: TextElement[];
+}
 
-  if (certExists && forceRegenerate) {
-    console.log(`Regenerating certificate for participant ${participantId}. Deleting old one...`);
-    const oldCertPath = (existingCert as any[])[0].path;
-    if (oldCertPath) {
-      try {
-        await fs.unlink(path.join(process.cwd(), 'public', oldCertPath));
-        console.log(`Deleted old certificate file: ${oldCertPath}`);
-      } catch (e) {
-        console.error(`Failed to delete old certificate file, but continuing:`, e);
+interface ParticipantData {
+  name: string;
+  email: string;
+  token: string;
+  event_name: string;
+  certificate_number: string;
+  date: string;
+  [key: string]: any;
+}
+
+export async function generateCertificateWithTemplate(
+  template: Template,
+  participantData: ParticipantData,
+  eventId: string,
+  suffix: string = ''
+): Promise<string> {
+  try {
+    // Load the background image
+    let backgroundImage;
+    if (template.image.startsWith('data:')) {
+      // Base64 image
+      const base64Data = template.image.replace(/^data:image\/[a-z]+;base64,/, '');
+      const buffer = Buffer.from(base64Data, 'base64');
+      backgroundImage = await loadImage(buffer);
+    } else {
+      // File path
+      const imagePath = path.join(process.cwd(), 'public', template.image);
+      backgroundImage = await loadImage(imagePath);
+    }
+
+    // Create canvas with background image dimensions
+    const canvas = createCanvas(backgroundImage.width, backgroundImage.height);
+    const ctx = canvas.getContext('2d');
+
+    // Draw background image
+    ctx.drawImage(backgroundImage, 0, 0);
+
+    // Process each text element
+    for (const element of template.elements) {
+      let text = '';
+      
+      // Get text based on element type
+      switch (element.type) {
+        case 'participant_name':
+          text = participantData.name.toUpperCase(); // Auto uppercase
+          break;
+        case 'event_name':
+          text = participantData.event_name;
+          break;
+        case 'certificate_number':
+          text = participantData.certificate_number;
+          break;
+        case 'date':
+          text = participantData.date;
+          break;
+        case 'token':
+          text = participantData.token;
+          break;
+        default:
+          text = element.text;
       }
-    }
-    await db.execute('DELETE FROM certificates WHERE participant_id = ?', [participantId]);
-    console.log(`Removed old certificate record for participant ${participantId}`);
-  }
 
-  // Ambil data peserta, event, dan template
-  const [rows] = await db.execute(`
-    SELECT p.*, t.token, t.id as ticket_id, e.id as event_id, e.name as event_name, e.slug as event_slug, e.start_time, ct.template_path, ct.template_fields
-    FROM participants p
-    JOIN tickets t ON p.ticket_id = t.id
-    JOIN events e ON t.event_id = e.id
-    LEFT JOIN certificate_templates ct ON ct.event_id = e.id
-    WHERE p.id = ?
-    ORDER BY ct.created_at DESC
-    LIMIT 1
-  `, [participantId])
+      // Set font properties
+      let fontStyle = '';
+      if (element.fontStyle === 'italic') fontStyle += 'italic ';
+      if (element.fontWeight === 'bold') fontStyle += 'bold ';
+      
+      ctx.font = `${fontStyle}${element.fontSize}px ${element.fontFamily}`;
+      ctx.fillStyle = element.color;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
 
-  const participantData = (rows as any[])[0]
-  if (!participantData || !participantData.template_path) {
-    throw new Error('Template untuk event ini belum ada. Silakan upload template terlebih dahulu.')
-  }
+      // Calculate position (convert from design coordinates to canvas coordinates)
+      const scaleX = backgroundImage.width / 800; // Design canvas width
+      const scaleY = backgroundImage.height / 600; // Design canvas height
+      
+      const x = (element.x + element.width / 2) * scaleX;
+      const y = (element.y + element.height / 2) * scaleY;
 
-  // Check if template file exists
-  const templatePath = path.join(process.cwd(), 'public', participantData.template_path)
-  try {
-    await fs.access(templatePath)
-  } catch {
-    throw new Error('Template file tidak ditemukan di server. Silakan upload ulang template.')
-  }
-
-  const fields = typeof participantData.template_fields === 'string' ? JSON.parse(participantData.template_fields) : participantData.template_fields
-  let width_img = 900, height_img = 636
-  try {
-    const sharp = (await import('sharp')).default
-    const imageBytes = await fs.readFile(templatePath)
-    const meta = await sharp(imageBytes).metadata()
-    width_img = meta.width || 900
-    height_img = meta.height || 636
-  } catch {}
-
-  const eventSlug = participantData.event_slug || ''
-  const eventDate = participantData.start_time ? new Date(participantData.start_time) : new Date()
-  const bulanRomawi = ['', 'I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 'XI', 'XII']
-  const mmRomawi = bulanRomawi[eventDate.getMonth() + 1]
-  const yyyy = eventDate.getFullYear()
-  const certificateNumber = `NOMOR : ${participantData.id}${participantData.event_id}/${eventSlug}/${mmRomawi}/${yyyy}`
-
-  const pdfDoc = await PDFDocument.create()
-  const page = pdfDoc.addPage([842, 595])
-
-  const templateImageBytes = await fs.readFile(templatePath)
-  let imageEmbed
-  if (participantData.template_path.toLowerCase().endsWith('.png')) {
-    imageEmbed = await pdfDoc.embedPng(templateImageBytes)
-  } else if (
-    participantData.template_path.toLowerCase().endsWith('.jpg') ||
-    participantData.template_path.toLowerCase().endsWith('.jpeg')
-  ) {
-    imageEmbed = await pdfDoc.embedJpg(templateImageBytes)
-  } else {
-    throw new Error('Template must be PNG or JPG/JPEG')
-  }
-
-  page.drawImage(imageEmbed, { x: 0, y: 0, width: 842, height: 595 })
-
-  for (const f of fields) {
-    if (f.active === false) continue
-    let value = ''
-    if (f.key === 'name') value = participantData.name.toUpperCase()
-    else if (f.key === 'event') value = participantData.event_name || ''
-    else if (f.key === 'number') value = certificateNumber
-    else if (f.key === 'token') value = participantData.token
-    else if (f.key === 'date') value = new Date().toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric'})
-    else value = f.label || ''
-
-    const x_pdf = (f.x / width_img) * 842
-    const y_pdf = 595 - ((f.y / height_img) * 595)
-
-    const fontMap = {
-      Helvetica: { normal: StandardFonts.Helvetica, bold: StandardFonts.HelveticaBold, italic: StandardFonts.HelveticaOblique, bolditalic: StandardFonts.HelveticaBoldOblique },
-      'Times Roman': { normal: StandardFonts.TimesRoman, bold: StandardFonts.TimesRomanBold, italic: StandardFonts.TimesRomanItalic, bolditalic: StandardFonts.TimesRomanBoldItalic },
-      Courier: { normal: StandardFonts.Courier, bold: StandardFonts.CourierBold, italic: StandardFonts.CourierOblique, bolditalic: StandardFonts.CourierBoldOblique },
+      // Draw text
+      ctx.fillText(text, x, y);
     }
 
-    const fontSize = f.fontSize || 24
-    let styleKey: 'normal' | 'bold' | 'italic' | 'bolditalic' = 'normal'
-    if (f.bold && f.italic) styleKey = 'bolditalic'
-    else if (f.bold) styleKey = 'bold'
-    else if (f.italic) styleKey = 'italic'
+    // Generate filename
+    const timestamp = Date.now();
+    const filename = `certificate_${participantData.name.replace(/\s+/g, '_')}_${eventId}_${suffix}_${timestamp}.png`;
+    const outputPath = path.join(process.cwd(), 'public', 'certificates', filename);
 
-    const font = await pdfDoc.embedFont((fontMap[f.fontFamily as keyof typeof fontMap]?.[styleKey]) || StandardFonts.Helvetica)
-    
-    const sanitize = (str: string) => str.replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/[^\x20-\x7E\u00A0-\u024F]/g, '')
-    const safeValue = sanitize(value)
-    const textWidth = font.widthOfTextAtSize(safeValue, fontSize)
-    
-    page.drawText(safeValue, { x: x_pdf - textWidth / 2, y: y_pdf, size: fontSize, font, color: rgb(0,0,0) })
+    // Ensure certificates directory exists
+    const certificatesDir = path.join(process.cwd(), 'public', 'certificates');
+    if (!fs.existsSync(certificatesDir)) {
+      fs.mkdirSync(certificatesDir, { recursive: true });
+    }
+
+    // Save the certificate
+    const buffer = canvas.toBuffer('image/png');
+    fs.writeFileSync(outputPath, buffer);
+
+    return `/certificates/${filename}`;
+  } catch (error) {
+    console.error('Error generating certificate:', error);
+    throw new Error('Failed to generate certificate');
   }
+}
 
-  const certDir = path.join(process.cwd(), 'public', 'certificates')
-  try { await fs.access(certDir) } catch { await fs.mkdir(certDir, { recursive: true }) }
-  
-  const filename = `cert_${participantData.event_id}_${participantData.id}.pdf`
-  const filePath = path.join(certDir, filename)
-  
-  await fs.writeFile(filePath, Buffer.from(await pdfDoc.save()))
-  
-  const relativePath = `/certificates/${filename}`
-  await db.execute('INSERT INTO certificates (participant_id, path, sent) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE path=VALUES(path), sent=FALSE', [participantData.id, relativePath, false])
-  
-  return { success: true, path: relativePath }
+export async function generateCertificatePreview(
+  template: Template,
+  sampleData: any = {}
+): Promise<Buffer> {
+  try {
+    // Default sample data
+    const defaultData = {
+      name: 'JOHN DOE',
+      event_name: 'Sample Event',
+      certificate_number: 'CERT-SAMPLE-001',
+      date: new Date().toLocaleDateString('id-ID', {
+        day: 'numeric',
+        month: 'long',
+        year: 'numeric'
+      }),
+      token: 'SAMPLE123'
+    };
+
+    const participantData = { ...defaultData, ...sampleData };
+
+    // Load the background image
+    let backgroundImage;
+    if (template.image.startsWith('data:')) {
+      const base64Data = template.image.replace(/^data:image\/[a-z]+;base64,/, '');
+      const buffer = Buffer.from(base64Data, 'base64');
+      backgroundImage = await loadImage(buffer);
+    } else {
+      const imagePath = path.join(process.cwd(), 'public', template.image);
+      backgroundImage = await loadImage(imagePath);
+    }
+
+    // Create canvas
+    const canvas = createCanvas(backgroundImage.width, backgroundImage.height);
+    const ctx = canvas.getContext('2d');
+
+    // Draw background
+    ctx.drawImage(backgroundImage, 0, 0);
+
+    // Process text elements
+    for (const element of template.elements) {
+      let text = '';
+      
+      switch (element.type) {
+        case 'participant_name':
+          text = participantData.name.toUpperCase();
+          break;
+        case 'event_name':
+          text = participantData.event_name;
+          break;
+        case 'certificate_number':
+          text = participantData.certificate_number;
+          break;
+        case 'date':
+          text = participantData.date;
+          break;
+        case 'token':
+          text = participantData.token;
+          break;
+        default:
+          text = element.text;
+      }
+
+      // Set font
+      let fontStyle = '';
+      if (element.fontStyle === 'italic') fontStyle += 'italic ';
+      if (element.fontWeight === 'bold') fontStyle += 'bold ';
+      
+      ctx.font = `${fontStyle}${element.fontSize}px ${element.fontFamily}`;
+      ctx.fillStyle = element.color;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+
+      // Calculate position
+      const scaleX = backgroundImage.width / 800;
+      const scaleY = backgroundImage.height / 600;
+      
+      const x = (element.x + element.width / 2) * scaleX;
+      const y = (element.y + element.height / 2) * scaleY;
+
+      // Draw text
+      ctx.fillText(text, x, y);
+    }
+
+    return canvas.toBuffer('image/png');
+  } catch (error) {
+    console.error('Error generating certificate preview:', error);
+    throw new Error('Failed to generate certificate preview');
+  }
 }
