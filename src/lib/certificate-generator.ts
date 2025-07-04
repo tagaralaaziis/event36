@@ -1,156 +1,122 @@
-import fs from 'fs';
-import path from 'path';
-import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
-import { db } from './db';
+import { PDFDocument, rgb, StandardFonts } from 'pdf-lib'
+import fs from 'fs/promises'
+import path from 'path'
+import db from './db'
 
 export interface CertificateData {
-  participantName: string;
-  eventName: string;
-  eventDate: string;
-  eventLocation?: string;
-  completionDate?: string;
-  hours?: number;
-  instructor?: string;
-  projectCompleted?: string;
+  participantName: string
+  eventName: string
+  eventDate: string
+  eventLocation?: string
+  completionDate?: string
+  certificateId?: string
+  additionalInfo?: string
 }
 
 export interface CertificateTemplate {
-  id: number;
-  event_id: number;
-  template_path: string;
-  template_fields: any;
+  id: number
+  event_id: number
+  template_path: string
+  template_fields: any
 }
 
+// Generate certificate with participant ID
 export async function generateCertificate(
-  participantId: number,
-  templateId?: number
-): Promise<string> {
+  participantId: number, 
+  templateId?: number,
+  forceRegenerate: boolean = false
+): Promise<{ success: boolean; path?: string; error?: string }> {
   try {
     // Get participant data
-    const participantQuery = `
-      SELECT 
-        p.id,
-        p.name,
-        p.email,
-        p.phone,
-        p.address,
-        p.registered_at,
-        t.token,
-        t.is_verified,
-        e.id as event_id,
-        e.name as event_name,
-        e.type as event_type,
-        e.location as event_location,
-        e.start_time as event_start_time,
-        e.end_time as event_end_time
+    const [participantRows]: any = await db.execute(`
+      SELECT p.*, t.token, e.name as event_name, e.location, e.start_time, e.end_time
       FROM participants p
       JOIN tickets t ON p.ticket_id = t.id
       JOIN events e ON t.event_id = e.id
       WHERE p.id = ?
-    `;
-    
-    const participants = await db.query(participantQuery, [participantId]);
-    
-    if (!participants || participants.length === 0) {
-      throw new Error('Participant not found');
+    `, [participantId])
+
+    if (!participantRows || participantRows.length === 0) {
+      throw new Error('Participant not found')
     }
-    
-    const participant = participants[0];
-    
-    // Get certificate template
-    let template: CertificateTemplate | null = null;
-    
+
+    const participant = participantRows[0]
+
+    // Check if certificate already exists and not forcing regeneration
+    if (!forceRegenerate) {
+      const [existingCerts]: any = await db.execute(
+        'SELECT * FROM certificates WHERE participant_id = ?',
+        [participantId]
+      )
+
+      if (existingCerts && existingCerts.length > 0) {
+        return { success: true, path: existingCerts[0].path }
+      }
+    }
+
+    // Get template if specified
+    let template = null
     if (templateId) {
-      const templateQuery = `
-        SELECT * FROM certificate_templates 
-        WHERE id = ? AND event_id = ?
-      `;
-      const templates = await db.query(templateQuery, [templateId, participant.event_id]);
-      template = templates[0] || null;
-    } else {
-      // Get default template for event
-      const templateQuery = `
-        SELECT * FROM certificate_templates 
-        WHERE event_id = ? 
-        ORDER BY created_at ASC 
-        LIMIT 1
-      `;
-      const templates = await db.query(templateQuery, [participant.event_id]);
-      template = templates[0] || null;
+      const [templateRows]: any = await db.execute(
+        'SELECT * FROM certificate_templates WHERE id = ?',
+        [templateId]
+      )
+      if (templateRows && templateRows.length > 0) {
+        template = templateRows[0]
+      }
     }
-    
-    // Create certificate data
+
+    // Generate certificate
     const certificateData: CertificateData = {
       participantName: participant.name,
       eventName: participant.event_name,
-      eventDate: new Date(participant.event_start_time).toLocaleDateString('id-ID', {
-        year: 'numeric',
-        month: 'long',
-        day: 'numeric'
-      }),
-      eventLocation: participant.event_location,
-      completionDate: new Date().toLocaleDateString('id-ID', {
-        year: 'numeric',
-        month: 'long',
-        day: 'numeric'
-      })
-    };
-    
-    // Generate PDF certificate
-    const pdfBytes = await generateCertificatePDF(certificateData, template);
-    
-    // Save certificate file
-    const certificatesDir = path.join(process.cwd(), 'public', 'certificates');
-    if (!fs.existsSync(certificatesDir)) {
-      fs.mkdirSync(certificatesDir, { recursive: true });
+      eventDate: new Date(participant.start_time).toLocaleDateString('id-ID'),
+      eventLocation: participant.location,
+      completionDate: new Date().toLocaleDateString('id-ID'),
+      certificateId: `CERT-${participant.token}-${Date.now()}`
     }
-    
-    const filename = `cert_${participant.name.replace(/\s+/g, '_').toLowerCase()}_${participant.event_name.replace(/\s+/g, '_').toLowerCase()}.pdf`;
-    const filepath = path.join(certificatesDir, filename);
-    const relativePath = `/certificates/${filename}`;
-    
-    fs.writeFileSync(filepath, pdfBytes);
-    
-    // Save certificate record to database
-    const insertQuery = `
+
+    const certificatePath = await createCertificatePDF(certificateData, template)
+
+    // Save certificate record
+    const [result]: any = await db.execute(`
       INSERT INTO certificates (participant_id, template_id, path, sent, created_at)
       VALUES (?, ?, ?, FALSE, NOW())
       ON DUPLICATE KEY UPDATE
-      path = VALUES(path),
-      template_id = VALUES(template_id),
-      created_at = NOW()
-    `;
-    
-    await db.execute(insertQuery, [
-      participantId,
-      template?.id || null,
-      relativePath
-    ]);
-    
-    return relativePath;
-    
+      path = VALUES(path), template_id = VALUES(template_id), created_at = NOW()
+    `, [participantId, templateId || null, certificatePath])
+
+    return { success: true, path: certificatePath }
+
   } catch (error) {
-    console.error('Error generating certificate:', error);
-    throw error;
+    console.error('Error generating certificate:', error)
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
   }
 }
 
-async function generateCertificatePDF(
-  data: CertificateData,
-  template: CertificateTemplate | null
-): Promise<Uint8Array> {
+// Generate certificate with template
+export async function generateCertificateWithTemplate(
+  participantId: number,
+  templateId: number,
+  forceRegenerate: boolean = false
+): Promise<{ success: boolean; path?: string; error?: string }> {
+  return await generateCertificate(participantId, templateId, forceRegenerate)
+}
+
+// Create PDF certificate
+async function createCertificatePDF(data: CertificateData, template?: any): Promise<string> {
   try {
     // Create a new PDF document
-    const pdfDoc = await PDFDocument.create();
-    const page = pdfDoc.addPage([842, 595]); // A4 landscape
+    const pdfDoc = await PDFDocument.create()
+    const page = pdfDoc.addPage([842, 595]) // A4 landscape
     
     // Get fonts
-    const titleFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-    const bodyFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
-    const nameFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-    
-    const { width, height } = page.getSize();
-    
+    const titleFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold)
+    const bodyFont = await pdfDoc.embedFont(StandardFonts.Helvetica)
+    const nameFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold)
+
+    const { width, height } = page.getSize()
+
     // Certificate border
     page.drawRectangle({
       x: 50,
@@ -159,169 +125,191 @@ async function generateCertificatePDF(
       height: height - 100,
       borderColor: rgb(0.2, 0.2, 0.2),
       borderWidth: 3,
-    });
-    
+    })
+
+    // Inner border
     page.drawRectangle({
-      x: 60,
-      y: 60,
-      width: width - 120,
-      height: height - 120,
+      x: 70,
+      y: 70,
+      width: width - 140,
+      height: height - 140,
       borderColor: rgb(0.4, 0.4, 0.4),
       borderWidth: 1,
-    });
-    
+    })
+
     // Title
     page.drawText('CERTIFICATE OF COMPLETION', {
-      x: width / 2 - 180,
+      x: width / 2 - 200,
       y: height - 150,
-      size: 28,
+      size: 32,
       font: titleFont,
       color: rgb(0.1, 0.1, 0.1),
-    });
-    
+    })
+
     // Subtitle
     page.drawText('This is to certify that', {
-      x: width / 2 - 80,
-      y: height - 200,
-      size: 14,
+      x: width / 2 - 100,
+      y: height - 220,
+      size: 16,
       font: bodyFont,
       color: rgb(0.3, 0.3, 0.3),
-    });
-    
+    })
+
     // Participant name
     page.drawText(data.participantName, {
       x: width / 2 - (data.participantName.length * 8),
-      y: height - 250,
-      size: 24,
+      y: height - 280,
+      size: 28,
       font: nameFont,
       color: rgb(0.1, 0.1, 0.1),
-    });
-    
+    })
+
     // Event details
     page.drawText('has successfully completed', {
-      x: width / 2 - 90,
-      y: height - 300,
-      size: 14,
+      x: width / 2 - 120,
+      y: height - 330,
+      size: 16,
       font: bodyFont,
       color: rgb(0.3, 0.3, 0.3),
-    });
-    
+    })
+
     page.drawText(data.eventName, {
       x: width / 2 - (data.eventName.length * 6),
-      y: height - 340,
-      size: 18,
+      y: height - 370,
+      size: 20,
       font: titleFont,
       color: rgb(0.1, 0.1, 0.1),
-    });
-    
+    })
+
     // Date and location
-    if (data.eventLocation) {
-      page.drawText(`Location: ${data.eventLocation}`, {
-        x: width / 2 - 100,
-        y: height - 380,
+    if (data.eventDate) {
+      page.drawText(`Date: ${data.eventDate}`, {
+        x: 150,
+        y: height - 450,
         size: 12,
         font: bodyFont,
-        color: rgb(0.4, 0.4, 0.4),
-      });
+        color: rgb(0.3, 0.3, 0.3),
+      })
     }
-    
-    page.drawText(`Date: ${data.eventDate}`, {
-      x: width / 2 - 60,
-      y: height - 400,
-      size: 12,
-      font: bodyFont,
-      color: rgb(0.4, 0.4, 0.4),
-    });
-    
+
+    if (data.eventLocation) {
+      page.drawText(`Location: ${data.eventLocation}`, {
+        x: 150,
+        y: height - 470,
+        size: 12,
+        font: bodyFont,
+        color: rgb(0.3, 0.3, 0.3),
+      })
+    }
+
+    // Certificate ID
+    if (data.certificateId) {
+      page.drawText(`Certificate ID: ${data.certificateId}`, {
+        x: width - 300,
+        y: 100,
+        size: 10,
+        font: bodyFont,
+        color: rgb(0.5, 0.5, 0.5),
+      })
+    }
+
     // Completion date
-    page.drawText(`Issued on: ${data.completionDate}`, {
-      x: width / 2 - 70,
-      y: height - 450,
+    page.drawText(`Issued on: ${data.completionDate || new Date().toLocaleDateString('id-ID')}`, {
+      x: width - 300,
+      y: 80,
       size: 10,
       font: bodyFont,
       color: rgb(0.5, 0.5, 0.5),
-    });
+    })
+
+    // Save PDF
+    const pdfBytes = await pdfDoc.save()
     
-    // Signature area
-    page.drawText('_____________________', {
-      x: width - 250,
-      y: 150,
-      size: 12,
-      font: bodyFont,
-      color: rgb(0.3, 0.3, 0.3),
-    });
+    // Ensure certificates directory exists
+    const certificatesDir = path.join(process.cwd(), 'public', 'certificates')
+    try {
+      await fs.access(certificatesDir)
+    } catch {
+      await fs.mkdir(certificatesDir, { recursive: true })
+    }
+
+    // Generate filename
+    const filename = `cert_${data.participantName.replace(/[^a-zA-Z0-9]/g, '_')}_${Date.now()}.pdf`
+    const filePath = path.join(certificatesDir, filename)
     
-    page.drawText('Authorized Signature', {
-      x: width - 240,
-      y: 130,
-      size: 10,
-      font: bodyFont,
-      color: rgb(0.5, 0.5, 0.5),
-    });
+    // Write file
+    await fs.writeFile(filePath, pdfBytes)
     
-    // Serialize the PDF
-    const pdfBytes = await pdfDoc.save();
-    return pdfBytes;
-    
+    return `/certificates/${filename}`
+
   } catch (error) {
-    console.error('Error generating PDF:', error);
-    throw error;
+    console.error('Error creating PDF certificate:', error)
+    throw error
   }
 }
 
-export async function generateMultipleCertificates(
+// Bulk generate certificates
+export async function bulkGenerateCertificates(
   participantIds: number[],
-  templateId?: number
-): Promise<string[]> {
-  const results: string[] = [];
-  
+  templateId?: number,
+  forceRegenerate: boolean = false
+): Promise<{ success: number; failed: number; results: any[] }> {
+  const results = []
+  let success = 0
+  let failed = 0
+
   for (const participantId of participantIds) {
     try {
-      const certificatePath = await generateCertificate(participantId, templateId);
-      results.push(certificatePath);
+      const result = await generateCertificate(participantId, templateId, forceRegenerate)
+      if (result.success) {
+        success++
+        results.push({ participantId, status: 'success', path: result.path })
+      } else {
+        failed++
+        results.push({ participantId, status: 'failed', error: result.error })
+      }
     } catch (error) {
-      console.error(`Error generating certificate for participant ${participantId}:`, error);
-      results.push('');
+      failed++
+      results.push({ 
+        participantId, 
+        status: 'failed', 
+        error: error instanceof Error ? error.message : 'Unknown error' 
+      })
     }
   }
-  
-  return results;
+
+  return { success, failed, results }
 }
 
+// Get certificate templates for event
 export async function getCertificateTemplates(eventId: number): Promise<CertificateTemplate[]> {
   try {
-    const query = `
-      SELECT * FROM certificate_templates 
-      WHERE event_id = ? 
-      ORDER BY created_at ASC
-    `;
-    const templates = await db.query(query, [eventId]);
-    return templates || [];
+    const [rows]: any = await db.execute(
+      'SELECT * FROM certificate_templates WHERE event_id = ? ORDER BY created_at DESC',
+      [eventId]
+    )
+    return rows || []
   } catch (error) {
-    console.error('Error fetching certificate templates:', error);
-    return [];
+    console.error('Error getting certificate templates:', error)
+    return []
   }
 }
 
-export async function saveCertificateTemplate(
+// Create certificate template
+export async function createCertificateTemplate(
   eventId: number,
   templatePath: string,
   templateFields: any
-): Promise<number> {
+): Promise<{ success: boolean; templateId?: number; error?: string }> {
   try {
-    const query = `
-      INSERT INTO certificate_templates (event_id, template_path, template_fields, created_at)
-      VALUES (?, ?, ?, NOW())
-    `;
-    const result = await db.execute(query, [
-      eventId,
-      templatePath,
-      JSON.stringify(templateFields)
-    ]);
-    
-    return result.insertId;
+    const [result]: any = await db.execute(
+      'INSERT INTO certificate_templates (event_id, template_path, template_fields) VALUES (?, ?, ?)',
+      [eventId, templatePath, JSON.stringify(templateFields)]
+    )
+
+    return { success: true, templateId: result.insertId }
   } catch (error) {
-    console.error('Error saving certificate template:', error);
-    throw error;
+    console.error('Error creating certificate template:', error)
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
   }
 }
