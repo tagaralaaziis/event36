@@ -3,7 +3,7 @@ import React, { useRef, useState, useEffect } from 'react'
 import Link from 'next/link'
 import { useParams, useRouter } from 'next/navigation'
 import toast, { Toaster } from 'react-hot-toast'
-import { ArrowLeft, Upload, Eye, Download, Save, Trash2 } from 'lucide-react'
+import { ArrowLeft, Upload, Eye, Download, Save, Trash2, Users, Award, Mail, RefreshCw, BarChart3 } from 'lucide-react'
 
 const FONT_FAMILIES = [
   { label: 'Helvetica', value: 'Helvetica' },
@@ -33,11 +33,14 @@ export default function GenerateCertificatesMultiPage() {
   const [saving, setSaving] = useState(false)
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [generating, setGenerating] = useState(false)
+  const [bulkSending, setBulkSending] = useState(false)
+  const [stats, setStats] = useState<any>(null)
   
   const previewRefs = useRef<(HTMLDivElement | null)[]>([])
 
   useEffect(() => {
     fetchData()
+    fetchStats()
   }, [eventId])
 
   const fetchData = async () => {
@@ -69,6 +72,18 @@ export default function GenerateCertificatesMultiPage() {
       }
     } catch (error) {
       console.error('Error fetching data:', error)
+    }
+  }
+
+  const fetchStats = async () => {
+    try {
+      const res = await fetch(`/api/events/${eventId}/generate-certificates/multi-template/stats`)
+      if (res.ok) {
+        const statsData = await res.json()
+        setStats(statsData)
+      }
+    } catch (error) {
+      console.error('Error fetching stats:', error)
     }
   }
 
@@ -170,6 +185,7 @@ export default function GenerateCertificatesMultiPage() {
     
     if (res.ok) {
       toast.success(`Template ${templateIndex} berhasil disimpan!`)
+      fetchStats() // Refresh stats
     } else {
       toast.error(`Gagal menyimpan template ${templateIndex}!`)
     }
@@ -201,31 +217,44 @@ export default function GenerateCertificatesMultiPage() {
     }
   }
 
-  const handleGenerateMulti = async () => {
-    if (!selectedParticipant) return toast.error('Pilih peserta terlebih dahulu!')
-    
+  const handleBulkGenerate = async () => {
     setGenerating(true)
-    toast.loading('Generating multi-certificate...', { id: 'generate' })
+    toast.loading('Generating multi-certificates for all participants...', { id: 'bulk-generate' })
     
-    const res = await fetch(`/api/events/${eventId}/generate-certificates/multi-template/generate`, {
+    const res = await fetch(`/api/events/${eventId}/generate-certificates/multi-template/bulk-generate`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ participantId: selectedParticipant })
+      headers: { 'Content-Type': 'application/json' }
     })
     
     if (res.ok) {
-      const blob = await res.blob()
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `certificates-multi-${selectedParticipant}.pdf`
-      a.click()
-      toast.success('Multi-certificate generated!', { id: 'generate' })
+      const result = await res.json()
+      toast.success(`${result.message} Success: ${result.successCount}, Failed: ${result.failureCount}`, { id: 'bulk-generate' })
+      fetchStats() // Refresh stats
     } else {
       const error = await res.json()
-      toast.error(error.error || 'Gagal generate multi-certificate!', { id: 'generate' })
+      toast.error(error.error || 'Gagal generate bulk certificates!', { id: 'bulk-generate' })
     }
     setGenerating(false)
+  }
+
+  const handleBulkSend = async () => {
+    setBulkSending(true)
+    toast.loading('Sending certificates to all participants...', { id: 'bulk-send' })
+    
+    const res = await fetch(`/api/events/${eventId}/generate-certificates/multi-template/bulk-send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }
+    })
+    
+    if (res.ok) {
+      const result = await res.json()
+      toast.success(`${result.message} Success: ${result.successCount}, Failed: ${result.failureCount}`, { id: 'bulk-send' })
+      fetchStats() // Refresh stats
+    } else {
+      const error = await res.json()
+      toast.error(error.error || 'Gagal bulk send certificates!', { id: 'bulk-send' })
+    }
+    setBulkSending(false)
   }
 
   const currentTemplate = templates.find(t => t.templateIndex === activeTab)
@@ -249,6 +278,81 @@ export default function GenerateCertificatesMultiPage() {
       
       <div className="w-full max-w-7xl mx-auto px-2 sm:px-4 md:px-8 py-4 sm:py-8">
         <Toaster position="top-right" />
+        
+        {/* Statistics Dashboard */}
+        {stats && (
+          <div className="mb-6 bg-white rounded-lg shadow-lg p-6">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
+                <BarChart3 className="h-5 w-5" />
+                Certificate Statistics
+              </h2>
+              <button onClick={fetchStats} className="text-blue-600 hover:text-blue-800">
+                <RefreshCw className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+              <div className="bg-blue-50 p-4 rounded-lg">
+                <div className="text-2xl font-bold text-blue-600">{stats.participants.verified_participants}</div>
+                <div className="text-sm text-blue-700">Verified Participants</div>
+              </div>
+              <div className="bg-green-50 p-4 rounded-lg">
+                <div className="text-2xl font-bold text-green-600">{stats.templates.template_count}</div>
+                <div className="text-sm text-green-700">Templates Configured</div>
+              </div>
+              <div className="bg-purple-50 p-4 rounded-lg">
+                <div className="text-2xl font-bold text-purple-600">{stats.participants.participants_with_certificates}</div>
+                <div className="text-sm text-purple-700">Participants with Certificates</div>
+              </div>
+              <div className="bg-orange-50 p-4 rounded-lg">
+                <div className="text-2xl font-bold text-orange-600">{stats.certificates.sent_certificates}</div>
+                <div className="text-sm text-orange-700">Certificates Sent</div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Bulk Actions */}
+        <div className="mb-6 bg-white rounded-lg shadow-lg p-6">
+          <h2 className="text-lg font-semibold text-gray-900 mb-4">Bulk Actions</h2>
+          <div className="flex flex-wrap gap-4">
+            <button
+              onClick={handleBulkGenerate}
+              disabled={generating}
+              className="px-6 py-3 bg-purple-600 hover:bg-purple-700 text-white font-semibold rounded-lg transition-all transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed flex items-center space-x-2"
+            >
+              {generating ? (
+                <>
+                  <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></div>
+                  <span>Generating...</span>
+                </>
+              ) : (
+                <>
+                  <Award className="h-5 w-5" />
+                  <span>Generate All Certificates</span>
+                </>
+              )}
+            </button>
+            
+            <button
+              onClick={handleBulkSend}
+              disabled={bulkSending}
+              className="px-6 py-3 bg-green-600 hover:bg-green-700 text-white font-semibold rounded-lg transition-all transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed flex items-center space-x-2"
+            >
+              {bulkSending ? (
+                <>
+                  <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></div>
+                  <span>Sending...</span>
+                </>
+              ) : (
+                <>
+                  <Mail className="h-5 w-5" />
+                  <span>Send All Certificates</span>
+                </>
+              )}
+            </button>
+          </div>
+        </div>
         
         {/* Participant Selection */}
         {participants.length > 0 && (
@@ -448,27 +552,6 @@ export default function GenerateCertificatesMultiPage() {
             )}
           </div>
         )}
-
-        {/* Generate Multi-Certificate Button */}
-        <div className="mt-6 flex justify-center">
-          <button
-            onClick={handleGenerateMulti}
-            disabled={generating || !selectedParticipant}
-            className="px-8 py-3 bg-purple-600 hover:bg-purple-700 text-white font-semibold rounded-lg transition-all transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed flex items-center space-x-2"
-          >
-            {generating ? (
-              <>
-                <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></div>
-                <span>Generating...</span>
-              </>
-            ) : (
-              <>
-                <Download className="h-5 w-5" />
-                <span>Generate Multi-Certificate PDF</span>
-              </>
-            )}
-          </button>
-        </div>
 
         {/* Preview Modal */}
         {previewUrl && (
